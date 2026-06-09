@@ -23,10 +23,6 @@ pip install -r requirements.txt
 
 ## Configuration
 
-```bash
-cp .env.example .env
-```
-
 Open `.env` and fill in:
 
 ```bash
