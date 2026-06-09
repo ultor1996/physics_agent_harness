@@ -57,15 +57,6 @@ There are two agent types. Both support the same tools — the difference is how
 - `CodeAgent` — LLM writes Python code. Supports loops, conditions, combining results. Best for open-ended tasks. Uses `code_agent.yaml` as default prompt.
 - `ToolCallingAgent` — LLM writes JSON tool calls. Safe and predictable. Best for fixed, simple tool calls. Uses `toolcalling_agent.yaml` as default prompt.
 
-```python
-# CodeAgent — LLM writes this
-results = web_search("AI trends 2025")
-final_answer(results)
-
-# ToolCallingAgent — LLM writes this
-{"tool": "web_search", "arguments": {"query": "AI trends 2025"}}
-```
-
 ## Prompt YAML structure
 
 Each agent has a prompt YAML with 4 sections. Each section is called at a different moment:
