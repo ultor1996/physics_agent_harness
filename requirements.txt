@@ -1,0 +1,5 @@
+smolagents[toolkit]
+smolagents[litellm]
+pandas
+pyyaml
+python-dotenv
