@@ -1,6 +1,6 @@
 import yaml
 from smolagents import CodeAgent
-from tools.custom_tools import analyze_dataframe
+from tools.gw_tools import analyze_dataframe
 
 
 def load_prompt(path: str) -> dict:

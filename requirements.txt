@@ -3,3 +3,6 @@ smolagents[litellm]
 pandas
 pyyaml
 python-dotenv
+pycbc
+numpy
+scipy
