@@ -3,9 +3,10 @@ from pathlib import Path
 from smolagents import CodeAgent
 from tools.gw_tools import (
     load_gw_data,
-    matched_filter_chirp_mass,
-    estimate_component_masses,
+    seed_pe_prior_via_matched_filter,
+    run_bayesian_pe,
     classify_merger_type,
+    plot_chirp_signal,
 )
 
 def create_gw_agent(model, log_path: str = None):
@@ -16,15 +17,22 @@ def create_gw_agent(model, log_path: str = None):
     return CodeAgent(
         tools=[
             load_gw_data,
-            matched_filter_chirp_mass,
-            estimate_component_masses,
+            seed_pe_prior_via_matched_filter,
+            run_bayesian_pe,
             classify_merger_type,
+            plot_chirp_signal,
         ],
         model=model,
         prompt_templates=prompt_templates,
-        max_steps=5,
-        planning_interval=5,
+        max_steps=8,
+        planning_interval=None,
         additional_authorized_imports=[
-            "numpy", "pycbc", "json", "math"
-        ],
+    "numpy", "pycbc", "json", "math",
+    "gwpy", "gwpy.timeseries",
+    "scipy", "scipy.signal",
+    "matplotlib", "matplotlib.pyplot",
+    "bilby", "os", "pathlib",
+    "logging", "warnings",
+],
+        executor_kwargs={"timeout_seconds": 1700},    
     )

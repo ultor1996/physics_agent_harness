@@ -16,6 +16,7 @@ build/
 data/
 *.csv
 *.json
+.distance_marginalization_lookup.npz
 
 # Jupyter
 .ipynb_checkpoints/

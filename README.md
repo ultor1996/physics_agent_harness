@@ -1,11 +1,12 @@
 # physics_agent_harness
 
-Experiment harness for agents, built on [smolagents](https://github.com/huggingface/smolagents).
+Agentic gravitational-wave parameter estimation pipeline built on [smolagents](https://github.com/huggingface/smolagents). Designed as an external pipeline for [GW Merger Bench](https://github.com/your-username/GW_merger_bench).
 
 ## Prerequisites
 
 - Python 3.10+
-- Access to a LiteLLM-compatible endpoint (or a [Hugging Face account](https://huggingface.co/join))
+- Access to a LiteLLM-compatible endpoint
+- pycbc, bilby, gwpy (installed via requirements)
 
 ## Installation
 
@@ -14,144 +15,157 @@ git clone https://github.com/your-username/physics_agent_harness.git
 cd physics_agent_harness
 
 python -m venv venv
-source venv/bin/activate        # Mac/Linux
-# venv\Scripts\activate         # Windows
+source venv/bin/activate
 
-# installs smolagents[toolkit], smolagents[litellm], and other dependencies
 pip install -r requirements.txt
 ```
 
 ## Configuration
 
-Open `.env` and fill in:
+Copy `.env.example` to `.env` and fill in:
 
 ```bash
-# LiteLLM endpoint
-OPENAI_BASE_URL=http://your-litellm-host/v1
 OPENAI_API_BASE=http://your-litellm-host/v1
 OPENAI_API_KEY=your_api_key_here
-
-# Or Hugging Face
-HF_TOKEN=your_huggingface_token_here
 ```
 
 > `.env` is in `.gitignore` and will never be committed.
 
 ## Usage
 
+The pipeline is called by the benchmark runner — it is not invoked directly. The benchmark passes an `input.json` path as the sole argument:
+
 ```bash
-python run.py "Research the latest LLM benchmarks and summarize the top 3 models"
-python run.py "Load data/results.csv and tell me which experiment had the highest accuracy"
+python run.py /path/to/input.json
 ```
 
-## How agents work
+`input.json` contains absolute paths to the strain/PSD `.npy` files, physics metadata, and an `output_path` where the agent must write its result.
 
-Each agent runs a ReAct loop: think → act → observe → repeat until `final_answer()` is called.
+### Running the unit tests
 
-There are two agent types. Both support the same tools — the difference is how the LLM expresses actions:
-
-- `CodeAgent` — LLM writes Python code. Supports loops, conditions, combining results. Best for open-ended tasks. Uses `code_agent.yaml` as default prompt.
-- `ToolCallingAgent` — LLM writes JSON tool calls. Safe and predictable. Best for fixed, simple tool calls. Uses `toolcalling_agent.yaml` as default prompt.
-
-## Prompt YAML structure
-
-Each agent has a prompt YAML with 4 sections. Each section is called at a different moment:
-
-```yaml
-system_prompt:       # always — the agent's main personality and instructions
-planning:            # only if planning_interval is set on the agent
-  initial_plan:      # runs at step 1 to produce a facts survey + plan
-  update_plan_pre_messages:
-  update_plan_post_messages:
-managed_agent:       # only when this agent is called by a manager agent
-  task:              # wraps the task string the manager sends down
-  report:            # wraps the result sent back up to the manager
-final_answer:        # only when the agent hits max_steps without finishing
-  pre_messages:
-  post_messages:
+```bash
+python unit_test_tools.py
 ```
 
-If you don't pass a `prompt_templates` when creating an agent, smolagents loads its own default (`code_agent.yaml` for `CodeAgent`, `toolcalling_agent.yaml` for `ToolCallingAgent`). The manager in this repo uses the default — only the worker agents have custom prompts.
+Tests all 6 tools against a synthetic BBH injection with known parameters. Expected output: 29/29 passing.
 
-The YAML key names are hardcoded in smolagents — do not rename them or you will get a `KeyError`.
+## How the pipeline works
 
-## Configuring agents and models
+```
+run.py
+  ↓
+build_task()      — constructs a 6-step task prompt with exact tool arguments
+  ↓
+create_gw_agent() — CodeAgent with 5 tools, planning disabled, max_steps=8
+  ↓
+agent.run(task)   — executes the 6-step pipeline in a single code block
+  ↓
+sanitise()        — validates output types and fills missing keys
+  ↓
+output.json       — written to the path specified in input.json
+```
 
-All agent and model declarations are in `run.py`:
+## Agent tools
+
+| Tool | Purpose | Runtime |
+|---|---|---|
+| `load_gw_data` | Load 5 `.npy` files into a dict | ~1s |
+| `seed_pe_prior_via_matched_filter` | 40×12 coarse matched filter grid — provides Mc seed and merger time | ~60s |
+| `run_bayesian_pe` | Full Bilby + dynesty nested sampling PE | ~7–15 min |
+| `classify_merger_type` | BBH / BNS / NSBH from component masses | <1s |
+| `plot_chirp_signal` | 3-panel figure: whitened H1/L1 + Q-transform | ~10s |
+
+The 6th "tool" is `final_answer` — a built-in smolagents tool that terminates the agent and returns the result dict.
+
+### PE design
+
+`run_bayesian_pe` follows the [avivajpeyi GW PE tutorial](https://avivajpeyi.github.io/gw_pe_tutorial/workshop_notebook.html) conventions:
+
+- **Sampler**: dynesty nested sampling (`sample="slice"`, `nact=10`, `nlive=250`)
+- **Sampled parameters**: `chirp_mass`, `mass_ratio`, `theta_jn` (3D)
+- **Spins**: `a_1`, `a_2` fixed to `DeltaFunction(0.0)` for zero-spin dataset; switch to `Uniform(-spin_max, spin_max)` for spinning datasets
+- **Sky/orientation**: `ra`, `dec`, `psi` fixed to DeltaFunction — unreliable without timing delay
+- **Marginalised**: time, distance, phase analytically via `GravitationalWaveTransient`
+- **Time reference**: `start_time = -merger_time_s` shifts the data so the matched-filter SNR peak is near `geocent_time=0`, ensuring the ±0.1s marginalisation window covers the actual merger
+
+### Approximant-aware spin limits
 
 ```python
-research_agent = create_research_agent(model=make_model("mistral/mistral-small-latest"))
-data_agent     = create_data_agent(model=make_model("mistral/mistral-small-latest"))
+spin_limits = {
+    "IMRPhenomD":   0.88,
+    "IMRPhenomXHM": 0.99,
+    "SEOBNRv4":     0.99,
+}
+```
 
-manager = CodeAgent(
-    tools=[],
-    model=make_model("mistral/mistral-small-latest"),
-    managed_agents=[research_agent, data_agent],
+When sampling spins, the prior range is automatically set from this dict based on the `approximant` argument passed by the benchmark.
+
+## Agent configuration
+
+`agents/gw_agent.py`:
+
+```python
+CodeAgent(
+    tools=[load_gw_data, seed_pe_prior_via_matched_filter,
+           run_bayesian_pe, classify_merger_type, plot_chirp_signal],
+    model=model,
+    prompt_templates=prompt_templates,
+    max_steps=8,
+    planning_interval=None,    # planning disabled — fixed 6-step pipeline
+    additional_authorized_imports=[
+        "numpy", "pycbc", "json", "math",
+        "gwpy", "gwpy.timeseries",
+        "scipy", "scipy.signal",
+        "matplotlib", "matplotlib.pyplot",
+        "bilby", "os", "pathlib", "logging", "warnings",
+    ],
+    executor_kwargs={"timeout_seconds": 1700},
 )
 ```
 
-`managed_agents` is a registration list — it tells the manager which agents exist. It does not control call order. The manager's LLM decides at runtime which agent to call and when based on the task.
+`planning_interval=None` is critical — setting it to any integer causes the agent to fire a planning step at step 1 (due to `(step-1) % interval == 0`), which wastes tokens and confuses the agent since its tools are not visible in the planning context.
 
-### Controlling steps per agent
+## Output
 
-Each agent runs until it calls `final_answer()` or hits `max_steps`. The default is 20 steps for all agents. Lower it to reduce LLM calls, raise it for complex tasks:
+The agent writes `output.json` to the path specified in `input.json`:
 
-```python
-# set at agent creation
-research_agent = create_research_agent(model=make_model("mistral/mistral-small-latest"))  # max_steps=5 set inside
-
-# or override per run
-manager.run("your task", max_steps=10)
+```json
+{
+    "chirp_mass_Msun": 28.04,
+    "mass1_Msun":      35.47,
+    "mass2_Msun":      28.75,
+    "mass_ratio":      0.810,
+    "network_snr":     23.09,
+    "merger_type":     "BBH"
+}
 ```
 
-Default values in smolagents:
-- `max_steps=20` — every agent, set in `MultiStepAgent.__init__()`
-- `planning_interval=None` — planning off by default
-- `stream_outputs=False` — streaming off by default
-
-If an agent hits `max_steps` without finishing, smolagents uses the `final_answer` section of the YAML as a fallback prompt to force a best-effort answer.
-
-### Model ID format for LiteLLM
-
-LiteLLM strips the provider prefix before forwarding to the server. Double the prefix so the server receives the correct ID:
-
-```python
-# Mistral — double the prefix
-make_model("mistral/mistral/mistral-small-latest")   # works
-make_model("mistral/mistral/mistral-large-latest")   # works
-```
+Plots are saved to `GW_merger_bench/results/plots/{task_id}_chirp.png`.
+Agent logs are saved to `GW_merger_bench/results/agent_logs/{task_id}_agent.log`.
 
 ## Repo structure
 
 ```
 physics_agent_harness/
-├── agents/             one file per agent
-├── prompts/            one yaml per agent — edit to tune behavior
-├── tools/              custom tools
-├── run.py              entry point
-├── requirements.txt
+├── agents/
+│   └── gw_agent.py          — CodeAgent with 5 GW tools
+├── prompts/
+│   └── gw_agent.yaml        — system prompt + final_answer fallback
+├── tools/
+│   └── gw_tools.py          — 6 tools (load, matched filter, PE, classify, plot)
+├── run.py                   — benchmark entry point
+├── unit_test_tools.py       — standalone tool unit tests (29 tests)
 └── .env.example
 ```
 
-## Adding a new agent
-
-1. `agents/my_agent.py` — define `create_my_agent(model)`
-2. `prompts/my_agent.yaml` — write the system prompt
-3. `run.py` — import and add to `managed_agents`
-
 ## Debugging
 
-```python
-result = manager.run("your task")
-print(manager.logs)   # full step-by-step trace
-```
+Common issues and fixes:
 
-If you see repeated `Import of X is not allowed` errors, add the import to `additional_authorized_imports` on the agent that needs it:
-
-```python
-# agents/data_agent.py or agents/manager_agent.py
-CodeAgent(
-    ...
-    additional_authorized_imports=["pandas", "csv", "numpy"],
-)
-```
+| Error | Fix |
+|---|---|
+| `Import of os is not allowed` | Add `"os", "pathlib"` to `additional_authorized_imports` |
+| `planning fires at step 1` | Set `planning_interval=None` |
+| `FileNotFoundError` on plot output | `plot_chirp_signal` creates the directory internally via `os.makedirs` |
+| `ZeroDivisionError` in smolagents | `planning_interval=0` — set to `None` instead |
+| Slice sampler warning from dynesty | Cosmetic only — add `warnings.filterwarnings("ignore", message="Specifying slice option")` |

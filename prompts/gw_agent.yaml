@@ -14,50 +14,45 @@ system_prompt: |
 
   {{managed_agents}}
 
+  ## CRITICAL — how to call tools correctly
+  Before calling any tool, read its docstring in the tools section above.
+  Use the EXACT argument names shown in the docstring — do not rename them
+  or guess based on context.
+
   ## Required output — call final_answer() with ALL 6 keys
   {
       "chirp_mass_Msun": <float>,
       "mass1_Msun":      <float>,
       "mass2_Msun":      <float>,
-      "mass_ratio":      <float>,   # q = m2/m1, range (0, 1]
-      "network_snr":     <float>,   # use best_snr from matched_filter_chirp_mass
-      "merger_type":     <str>,     # MUST be exactly "BBH", "BNS", or "NSBH"
+      "mass_ratio":      <float>,
+      "network_snr":     <float>,
+      "merger_type":     <str>,
   }
 
-  ## Step-by-step strategy
-  1. Call load_gw_data with the 6 file paths from the task description
-  2. Call matched_filter_chirp_mass on H1 strain — pass the approximant
-     from the task (e.g. "IMRPhenomD"). Use best_chirp_mass_Msun as your
-     chirp mass and best_snr as your network_snr.
-  3. Call estimate_component_masses with best_chirp_mass_Msun and
-     mass_ratio_guess=0.8 as a starting point. If best_snr from step 2
-     is low (< 8), try q=0.5 as the system may be more unequal.
-  4. Call classify_merger_type with mass1 and mass2
-  5. Call final_answer with all 6 parameters
-
   ## Hard rules
-  - merger_type MUST be exactly "BBH", "BNS", or "NSBH" — no other strings accepted
-  - All numeric values must be finite floats — never None, NaN, or strings
+  - merger_type MUST be exactly "BBH", "BNS", or "NSBH"
+  - All numeric values must be finite floats
   - chirp_mass_Msun must be between 1 and 500
-  - network_snr: use best_snr from matched_filter_chirp_mass
+  - network_snr: use best_snr from seed_pe_prior_via_matched_filter
+  - mass1_Msun and mass2_Msun come directly from run_bayesian_pe — do not compute them separately
 
 planning:
   initial_plan: |
     Task: {{task}}
 
     Produce a concrete plan:
-    1. Extract the 6 file paths and approximant from the task description
-    2. load_gw_data
-    3. matched_filter_chirp_mass on H1 with correct approximant
-    4. estimate_component_masses — start with q=0.8, try q=0.5 if best_snr < 8
-    5. classify_merger_type
-    6. final_answer with all 6 parameters
+    1. load_gw_data — load the 5 .npy files
+    2. seed_pe_prior_via_matched_filter — get chirp_mass_guess and mass_ratio_guess
+    3. run_bayesian_pe — full Bayesian PE, returns chirp_mass_Msun, mass_ratio,
+                         mass1_Msun, mass2_Msun directly
+    4. classify_merger_type — using pe["mass1_Msun"] and pe["mass2_Msun"]
+    5. plot_chirp_signal — save the chirp plot
+    6. final_answer — with all 6 keys from pe and mf
 
   update_plan_pre_messages: |
     Steps completed so far:
   update_plan_post_messages: |
-    Revise the remaining steps. If matched_filter_chirp_mass gave a low
-    best_snr (< 5), try a different mass_ratio_guess in estimate_component_masses.
+    Revise the remaining steps based on what has been completed.
 
 managed_agent:
   task: |
