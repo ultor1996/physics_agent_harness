@@ -32,67 +32,6 @@ def make_model():
         api_key=os.getenv("OPENAI_API_KEY"),
     )
 
-
-# def build_task(inp: dict) -> str:
-#     dp  = inp["data_paths"]
-#     sr  = inp.get('sample_rate_hz', 2048)
-#     app = inp.get('approximant', 'IMRPhenomD')
-#     fl  = inp.get('f_lower_hz', 20.0)
-#     return f"""Analyse this gravitational-wave merger event and return all 6 parameters.
-
-# Task ID:     {inp['task_id']}
-# Approximant: {app}
-# Sample rate: {sr} Hz
-# f_lower:     {fl} Hz
-
-# Step 1 — call load_gw_data with these exact arguments:
-#   strain_H1   = "{dp['strain_H1']}"
-#   strain_L1   = "{dp['strain_L1']}"
-#   psd_H1      = "{dp['psd_H1']}"
-#   psd_L1      = "{dp['psd_L1']}"
-#   psd_freqs   = "{dp['psd_freqs']}"
-#   sample_rate = {sr}
-
-# Step 2 — call matched_filter_chirp_mass with ONLY these arguments:
-#   strain      = data["strain_H1"]
-#   psd         = data["psd_H1"]
-#   psd_freqs   = data["psd_freqs"]
-#   strain_L1   = data["strain_L1"]
-#   psd_L1      = data["psd_L1"]
-#   sample_rate = data["sample_rate"]
-#   approximant = "{app}"
-#   f_lower     = {fl}
-
-# Step 3 — call parameter_estimation to refine chirp mass and mass ratio:
-#   strain_H1        = data["strain_H1"]
-#   psd_H1           = data["psd_H1"]
-#   strain_L1        = data["strain_L1"]
-#   psd_L1           = data["psd_L1"]
-#   psd_freqs        = data["psd_freqs"]
-#   sample_rate      = data["sample_rate"]
-#   chirp_mass_guess = mf["best_chirp_mass_Msun"]
-#   mass_ratio_guess = mf["best_mass_ratio"]
-
-# Step 4 — call estimate_component_masses:
-#   chirp_mass_Msun  = pe["chirp_mass_Msun"]
-#   mass_ratio_guess = pe["mass_ratio"]
-
-# Step 5 — call classify_merger_type:
-#   mass1_Msun = masses["mass1_Msun"]
-#   mass2_Msun = masses["mass2_Msun"]
-
-# Step 6 — call final_answer with this exact dict:
-#   {{
-#       "chirp_mass_Msun": float(pe["chirp_mass_Msun"]),
-#       "mass1_Msun":      float(masses["mass1_Msun"]),
-#       "mass2_Msun":      float(masses["mass2_Msun"]),
-#       "mass_ratio":      float(pe["mass_ratio"]),
-#       "network_snr":     float(mf["best_snr"]),
-#       "merger_type":     cls["merger_type"],
-#   }}
-#   merger_type must be exactly "BBH", "BNS", or "NSBH"
-# """
-
 def build_task(inp: dict, plots_dir: str = "/tmp") -> str:
     dp  = inp["data_paths"]
     sr  = inp.get('sample_rate_hz', 2048)
