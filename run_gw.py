@@ -27,7 +27,7 @@ REQUIRED_KEYS = [
 
 def make_model():
     return LiteLLMModel(
-        model_id="openai/gpt-5.4-2026-03-05",
+        model_id="openai/openai/gpt-5.4-2026-03-05",
         api_base=os.getenv("OPENAI_API_BASE"),
         api_key=os.getenv("OPENAI_API_KEY"),
     )
@@ -75,7 +75,7 @@ Step 3 — call run_bayesian_pe with these exact arguments:
   merger_time_s     = mf["merger_time_s"]
   f_lower           = {fl}
   approximant       = "{app}"
-  nlive             = 250
+  nlive             = 400
   This runs full Bayesian parameter estimation and takes several minutes —
   do not interrupt it or attempt a faster substitute.
   This returns mass1_Msun and mass2_Msun directly — do not call any other
@@ -93,6 +93,7 @@ Step 5 — call plot_chirp_signal with these exact arguments:
   sample_rate      = data["sample_rate"]
   chirp_mass_Msun  = pe["chirp_mass_Msun"]
   mass_ratio       = pe["mass_ratio"]
+  merger_time_s    = mf["merger_time_s"]
   output_path      = "{plot_path}"
   f_lower          = {fl}
   approximant      = "{app}"
@@ -154,18 +155,14 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"{inp['task_id']}_agent.log"
 
-    buf    = io.StringIO()
     result = {}
     try:
-        with redirect_stdout(buf):
+        with open(log_file, "w") as f, redirect_stdout(f):
             result = agent.run(task)
     except Exception as e:
         print(f"[gw_agent] agent error: {e}", file=sys.stderr)
-    finally:
-        log_content = buf.getvalue()
-        print(log_content)
-        with open(log_file, "w") as f:
-            f.write(log_content)
+        with open(log_file, "a") as f:
+            f.write(f"\n[gw_agent] agent error: {e}\n")
 
     if isinstance(result, dict):
         raw = result

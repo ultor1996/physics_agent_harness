@@ -50,22 +50,17 @@ def load_gw_data(strain_H1: str, strain_L1: str,
     }
 
 
-# =============================================================================
-# Tool 2 -- Fast matched filter (coarse seed for the PE prior only)
-# =============================================================================
-
 def _eval_single_template(args):
     """
     Evaluate one (Mc, q) template using both H1 and L1 detectors.
     Spins fixed to zero. Module-level function required for
     multiprocessing pickling. Returns (Mc, q, network_snr, m1, m2) or None.
     """
-    (Mc, q, strain_H1_arr, psd_H1_arr, strain_L1_arr, psd_L1_arr, freqs_arr,
+    (Mc, q, strain_H1_arr, psd_H1_trunc, strain_L1_arr, psd_L1_trunc, freqs_arr,
      delta_t, delta_f, flen, f_lower, approximant) = args
 
     try:
-        from pycbc.types import TimeSeries, FrequencySeries
-        from pycbc.psd import interpolate, inverse_spectrum_truncation
+        from pycbc.types import TimeSeries
         from pycbc.waveform import get_fd_waveform
         from pycbc.filter import matched_filter
         import numpy as np
@@ -73,6 +68,8 @@ def _eval_single_template(args):
         q  = float(np.clip(q, 0.05, 1.0))
         m1 = float(Mc * (1.0 + q) ** (1.0 / 5.0) / q ** (3.0 / 5.0))
         m2 = q * m1
+        if m2 < 1.0 or m1 > 200.0:
+            return None
 
         hp, _ = get_fd_waveform(
             approximant=approximant,
@@ -87,22 +84,11 @@ def _eval_single_template(args):
         elif len(hp) > flen:
             hp = hp[:flen]
 
-        sample_rate = int(round(1.0 / delta_t))
-
-        def build_psd(psd_arr):
-            psd_fs     = FrequencySeries(psd_arr, delta_f=float(freqs_arr[1] - freqs_arr[0]))
-            psd_interp = interpolate(psd_fs, delta_f)
-            return inverse_spectrum_truncation(
-                psd_interp, int(4 * sample_rate), low_frequency_cutoff=f_lower
-            )
-
-        psd_H1_trunc = build_psd(psd_H1_arr)
         strain_H1_ts = TimeSeries(strain_H1_arr, delta_t=delta_t)
         snr_H1       = matched_filter(hp, strain_H1_ts.to_frequencyseries(),
                                       psd=psd_H1_trunc, low_frequency_cutoff=f_lower)
         peak_H1      = float(abs(snr_H1).numpy().max())
 
-        psd_L1_trunc = build_psd(psd_L1_arr)
         strain_L1_ts = TimeSeries(strain_L1_arr, delta_t=delta_t)
         snr_L1       = matched_filter(hp, strain_L1_ts.to_frequencyseries(),
                                       psd=psd_L1_trunc, low_frequency_cutoff=f_lower)
@@ -114,7 +100,46 @@ def _eval_single_template(args):
     except Exception:
         return None
 
+@tool
+def build_pe_config(nlive: int, sample: str, walks: int, nact: int, dlogz: float,
+                     fix_spins: bool = True, fix_inclination: bool = True,
+                     rationale: str = "") -> dict:
+    """
+    Package your chosen PE sampling strategy into a validated config dict
+    to pass into run_bayesian_pe's `config` argument. This tool does NOT
+    choose any values for you -- you must decide nlive, sample, walks,
+    nact, dlogz yourself based on the
+    matched-filter seed (best_snr, best_chirp_mass_Msun) and your
+    remaining time budget, using the domain guidance you've been given.
 
+    Args:
+        nlive: number of dynesty live points you have chosen
+        sample: dynesty sample method you have chosen, e.g. "rwalk" or "slice"
+        walks: walks parameter for rwalk sampling
+        nact: autocorrelation multiple for rwalk termination
+        dlogz: evidence convergence criterion (smaller = more precise, slower)
+        fix_spins: whether to fix a_1/a_2 to zero (should almost always be True for this dataset)
+        fix_inclination: whether to fix theta_jn to zero (should almost always be True for this dataset)
+        rationale: your one-sentence reasoning for these choices, for logging
+    """
+    valid_samples = {"rwalk", "slice", "rslice", "unif"}
+    if sample not in valid_samples:
+        raise ValueError(f"sample must be one of {valid_samples}, got {sample!r}")
+    if nlive < 20:
+        raise ValueError("nlive too low to produce a usable posterior (minimum 20)")
+    if dlogz <= 0:
+        raise ValueError("dlogz must be positive")
+
+    return {
+        "fix_spins": bool(fix_spins),
+        "fix_inclination": bool(fix_inclination),
+        "nlive": int(nlive),
+        "sample": sample,
+        "walks": int(walks),
+        "nact": int(nact),
+        "dlogz": float(dlogz),
+        "rationale": rationale,
+    }
 @tool
 def seed_pe_prior_via_matched_filter(strain: list, psd: list, psd_freqs: list,
                                       strain_L1: list, psd_L1: list,
@@ -127,9 +152,10 @@ def seed_pe_prior_via_matched_filter(strain: list, psd: list, psd_freqs: list,
     to pass into run_bayesian_pe, which performs the actual parameter
     estimation. Always call run_bayesian_pe immediately after this tool.
 
-    Single 40x12 grid, spins fixed to zero, combines H1 and L1 network SNR.
-    Returns best_chirp_mass_Msun, best_mass_ratio, best_snr, best_mass1, best_mass2
-    -- a coarse seed only, not a result to report.
+    Grid over chirp mass and mass ratio, spins fixed to zero, combines
+    H1 and L1 network SNR. Returns best_chirp_mass_Msun, best_mass_ratio,
+    best_snr, best_mass1, best_mass2 -- a coarse seed only, not a result
+    to report.
 
     Args:
         strain: H1 strain time series -- use data["strain_H1"] from load_gw_data
@@ -142,6 +168,7 @@ def seed_pe_prior_via_matched_filter(strain: list, psd: list, psd_freqs: list,
         f_lower: lower frequency cutoff in Hz e.g. 20.0
     """
     import multiprocessing
+    import os
     from concurrent.futures import ProcessPoolExecutor
 
     delta_t       = 1.0 / sample_rate
@@ -155,73 +182,87 @@ def seed_pe_prior_via_matched_filter(strain: list, psd: list, psd_freqs: list,
     flen          = N // 2 + 1
     n_cores       = max(1, multiprocessing.cpu_count())
 
-    chirp_masses = np.logspace(np.log10(4), np.log10(90), 40)
-    mass_ratios  = np.linspace(0.1, 1.0, 12)
+    # Compute truncated PSDs ONCE, outside the per-template loop
+    from pycbc.psd import interpolate, inverse_spectrum_truncation
+    from pycbc.types import FrequencySeries
+
+    def build_psd_once(psd_arr):
+        psd_fs     = FrequencySeries(psd_arr, delta_f=float(freqs_arr[1] - freqs_arr[0]))
+        psd_interp = interpolate(psd_fs, delta_f)
+        return inverse_spectrum_truncation(
+            psd_interp, int(4 * sample_rate), low_frequency_cutoff=f_lower
+        )
+
+    psd_H1_trunc = build_psd_once(psd_H1_arr)
+    psd_L1_trunc = build_psd_once(psd_L1_arr)
+
+    chirp_masses = np.logspace(np.log10(4), np.log10(90), 30)
+    mass_ratios  = np.linspace(0.3, 1.0, 30)
 
     args = [
-        (Mc, q, strain_H1_arr, psd_H1_arr, strain_L1_arr, psd_L1_arr,
+        (Mc, q, strain_H1_arr, psd_H1_trunc, strain_L1_arr, psd_L1_trunc,
          freqs_arr, delta_t, delta_f, flen, f_lower, approximant)
         for Mc in chirp_masses
         for q  in mass_ratios
     ]
 
     results = []
-    with ProcessPoolExecutor(max_workers=n_cores) as ex:
-        for res in ex.map(_eval_single_template, args, chunksize=10):
+    if os.environ.get("GW_MERGER_BENCH_FORCE_SEQUENTIAL"):
+        for a in args:
+            res = _eval_single_template(a)
             if res is not None:
                 results.append(res)
+    else:
+        with ProcessPoolExecutor(max_workers=n_cores) as ex:
+            for res in ex.map(_eval_single_template, args, chunksize=10):
+                if res is not None:
+                    results.append(res)
 
     if not results:
+        # FIXED: fallback now includes merger_time_s, previously missing --
+        # caused a downstream KeyError in run_bayesian_pe when every
+        # template in the grid failed (e.g. due to a bug, or a task whose
+        # true parameters fall entirely outside the search grid).
         return {
             "best_chirp_mass_Msun": 25.0,
             "best_mass_ratio":      0.8,
             "best_snr":             0.0,
             "best_mass1":           29.0,
             "best_mass2":           23.0,
+            "merger_time_s":        8.0,
         }
 
     best = max(results, key=lambda x: x[2])
     Mc, q, snr, m1, m2 = best
 
-    # ── Find SNR peak time using best template ───────────────────────
-    # The SNR peak time is the matched-filter estimate of the merger
-    # time — far more reliable than raw strain amplitude for this purpose.
-    merger_time_s = 0.0
-    try:
-        from pycbc.types import TimeSeries, FrequencySeries
-        from pycbc.psd import interpolate, inverse_spectrum_truncation
-        from pycbc.waveform import get_fd_waveform
-        from pycbc.filter import matched_filter as _mf
+    # Find SNR peak time using the best template -- more reliable than
+    # raw strain amplitude for merger time estimation.
+    from pycbc.types import TimeSeries
+    from pycbc.waveform import get_fd_waveform
+    from pycbc.filter import matched_filter as _mf
 
-        q_b  = float(np.clip(q, 0.05, 1.0))
-        m1_b = float(Mc * (1.0 + q_b)**(1.0/5.0) / q_b**(3.0/5.0))
-        m2_b = q_b * m1_b
+    q_b  = float(np.clip(q, 0.05, 1.0))
+    m1_b = float(Mc * (1.0 + q_b) ** (1.0/5.0) / q_b ** (3.0/5.0))
+    m2_b = q_b * m1_b
 
-        hp_b, _ = get_fd_waveform(
-            approximant=approximant,
-            mass1=m1_b, mass2=m2_b,
-            spin1z=0.0, spin2z=0.0,
-            delta_f=delta_f, f_lower=f_lower,
-            f_final=float(0.5 / delta_t),
-        )
-        if len(hp_b) < flen:
-            hp_b.resize(flen)
-        elif len(hp_b) > flen:
-            hp_b = hp_b[:flen]
+    hp_b, _ = get_fd_waveform(
+        approximant=approximant,
+        mass1=m1_b, mass2=m2_b,
+        spin1z=0.0, spin2z=0.0,
+        delta_f=delta_f, f_lower=f_lower,
+        f_final=float(0.5 / delta_t),
+    )
+    if len(hp_b) < flen:
+        hp_b.resize(flen)
+    elif len(hp_b) > flen:
+        hp_b = hp_b[:flen]
 
-        psd_fs     = FrequencySeries(psd_H1_arr,
-                                      delta_f=float(freqs_arr[1] - freqs_arr[0]))
-        psd_interp = interpolate(psd_fs, delta_f)
-        psd_trunc  = inverse_spectrum_truncation(
-            psd_interp, int(4 * sample_rate), low_frequency_cutoff=f_lower
-        )
-        snr_ts         = _mf(hp_b,
-                              TimeSeries(strain_H1_arr, delta_t=delta_t).to_frequencyseries(),
-                              psd=psd_trunc, low_frequency_cutoff=f_lower)
-        peak_idx       = int(abs(snr_ts).numpy().argmax())
-        merger_time_s  = float(peak_idx) * delta_t
-    except Exception:
-        merger_time_s = float(len(strain_H1_arr)) * delta_t * 0.67  # fallback
+    # Reuse the already-truncated H1 PSD instead of recomputing it a third time
+    snr_ts    = _mf(hp_b,
+                     TimeSeries(strain_H1_arr, delta_t=delta_t).to_frequencyseries(),
+                     psd=psd_H1_trunc, low_frequency_cutoff=f_lower)
+    peak_idx  = int(abs(snr_ts).numpy().argmax())
+    merger_time_s = float(peak_idx) * delta_t
 
     return {
         "best_chirp_mass_Msun": round(float(Mc),       4),
@@ -232,12 +273,10 @@ def seed_pe_prior_via_matched_filter(strain: list, psd: list, psd_freqs: list,
         "merger_time_s":        round(merger_time_s,    4),
     }
 
-
 # =============================================================================
 # Tool 3 -- Full Bayesian parameter estimation
 #
-# Follows the avivajpeyi GW PE tutorial conventions:
-#   https://avivajpeyi.github.io/gw_pe_tutorial/workshop_notebook.html
+# 
 #
 #   - bilby.gw.prior.BBHPriorDict() as the base prior set
 #   - UniformInComponentsChirpMass for the chirp-mass prior (more
@@ -249,16 +288,6 @@ def seed_pe_prior_via_matched_filter(strain: list, psd: list, psd_freqs: list,
 #     result_class=CBCResult, so component masses / chi_eff / etc. come
 #     out of the posterior automatically ("Inference step" section)
 #
-#   The tutorial's GW150914 example fixes ra, dec, distance, theta_jn,
-#   psi, geocent_time to the known injection values and explicitly
-#   flags this with "# dont do this in a real run". Our agent does NOT
-#   know the true sky location, so we cannot use that shortcut --
-#   doing so previously caused a catastrophic failure (log_bayes_factor
-#   ~ -183) because the wrong fixed sky location biases the antenna
-#   pattern in the likelihood. Instead we sample ra/dec/theta_jn/psi
-#   genuinely and analytically marginalise time, distance, and phase,
-#   which is the standard honest rapid-PE approach when the true
-#   extrinsic parameters are unknown.
 # =============================================================================
 
 @tool
@@ -266,9 +295,10 @@ def run_bayesian_pe(strain_H1: list, psd_H1: list,
                      strain_L1: list, psd_L1: list,
                      psd_freqs: list, sample_rate: int,
                      chirp_mass_guess: float, mass_ratio_guess: float,
-                     merger_time_s: float = 10.72,
-                     f_lower: float = 20.0, approximant: str = "IMRPhenomD",
-                     nlive: int = 250) -> dict:
+                     given_ra: float, given_dec: float, given_psi: float, 
+                     config: dict,
+                     merger_time_s: float = None,
+                     f_lower: float = 20.0, approximant: str = "IMRPhenomD") -> dict:
     """
     Run full Bayesian parameter estimation with Bilby + dynesty nested
     sampling, following standard GW rapid-PE practice. Samples
@@ -294,26 +324,28 @@ def run_bayesian_pe(strain_H1: list, psd_H1: list,
         sample_rate: sampling rate in Hz -- use data["sample_rate"] from load_gw_data
         chirp_mass_guess: best_chirp_mass_Msun from seed_pe_prior_via_matched_filter
         mass_ratio_guess: best_mass_ratio from seed_pe_prior_via_matched_filter
+        config: dict from build_pe_config -- controls which parameters are
+                fixed vs sampled (free_psi, free_ra_dec, fix_spins,
+                fix_inclination) and sampler settings (nlive, sample,
+                walks, nact, dlogz). Always call build_pe_config first
+                and pass its output here unmodified.
         merger_time_s: merger_time_s from seed_pe_prior_via_matched_filter
+        given_ra: known right ascension in radians -- from task's given_parameters
+        given_dec: known declination in radians -- from task's given_parameters
+        given_psi: known polarisation angle in radians -- from task's given_parameters
         f_lower: lower frequency cutoff in Hz e.g. 20.0
         approximant: waveform approximant string e.g. IMRPhenomD
-        nlive: number of live points for dynesty -- higher is more accurate
-               but slower. 150 is a reasonable rapid-PE setting.
     """
     import os
-    os.environ["MPLBACKEND"] = "Agg"   # must be set before bilby/dynesty import
+    os.environ["MPLBACKEND"] = "Agg"
     import matplotlib
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    plt.switch_backend("Agg")
-    import logging
-    import warnings
-    warnings.filterwarnings("ignore", message="Starting a Matplotlib GUI outside of the main thread")
     import bilby
     import numpy as np
+    import logging
+    import time
 
-    bilby_logger = logging.getLogger("bilby")
-    bilby_logger.setLevel(logging.ERROR)
+    logging.getLogger("bilby").setLevel(logging.ERROR)
     logging.getLogger("dynesty").setLevel(logging.ERROR)
 
     sample_rate   = int(sample_rate)
@@ -325,31 +357,24 @@ def run_bayesian_pe(strain_H1: list, psd_H1: list,
 
     duration = float(len(strain_H1_arr) / sample_rate)
 
-    # ---- Interferometers from the supplied real strain + PSD arrays.
-    # (Unlike the tutorial's injection examples which build ifos via
-    #  set_strain_data_from_power_spectral_densities + inject_signal,
-    #  we already have real strain data, so we load it directly --
-    #  the same approach the tutorial uses for its GW150914 example,
-    #  just from arrays instead of GWOSC/gwpy.) ----
     ifo_H1 = bilby.gw.detector.get_empty_interferometer("H1")
     ifo_L1 = bilby.gw.detector.get_empty_interferometer("L1")
+
+    if merger_time_s is None:
+        peak_idx      = int(np.argmax(np.abs(strain_H1_arr)))
+        merger_time_s = float(peak_idx) / float(sample_rate)
 
     peak_time = float(merger_time_s)
 
     ifo_H1.strain_data.set_from_time_domain_strain(
-        strain_H1_arr,
-        sampling_frequency=float(sample_rate),
-        duration=duration,
-        start_time=-peak_time,
+        strain_H1_arr, sampling_frequency=float(sample_rate),
+        duration=duration, start_time=-peak_time,
     )
     ifo_L1.strain_data.set_from_time_domain_strain(
-        strain_L1_arr,
-        sampling_frequency=float(sample_rate),
-        duration=duration,
-        start_time=-peak_time,
+        strain_L1_arr, sampling_frequency=float(sample_rate),
+        duration=duration, start_time=-peak_time,
     )
-    # PyCBC-style PSDs are exactly zero below f_lower by construction;
-    # floor them so the Whittle likelihood never divides by zero.
+
     psd_H1_safe = np.where((psd_H1_arr <= 0) | (freqs_arr < f_lower), 1e-38, psd_H1_arr)
     psd_L1_safe = np.where((psd_L1_arr <= 0) | (freqs_arr < f_lower), 1e-38, psd_L1_arr)
 
@@ -376,75 +401,48 @@ def run_bayesian_pe(strain_H1: list, psd_H1: list,
         },
     )
 
-    # ---- Priors -- tutorial's "Create priors for analysis" pattern ----
     Mc_guess = max(float(chirp_mass_guess), 1.0)
+    q_guess  = float(np.clip(mass_ratio_guess, 0.05, 1.0))
+    m1_guess = Mc_guess * (1.0 + q_guess) ** (1.0/5.0) / q_guess ** (3.0/5.0)
+    m2_guess = q_guess * m1_guess
+
     priors = bilby.gw.prior.BBHPriorDict()
 
-    # UniformInComponentsChirpMass, narrowed around the matched-filter
-    # point estimate (tutorial uses a +/-5 Msun window around the known
-    # injection value for its toy example; we use a multiplicative
-    # window since chirp_mass_guess can range from a few to ~90 Msun).
     priors["chirp_mass"] = bilby.gw.prior.UniformInComponentsChirpMass(
-    minimum=max(2.0,  Mc_guess * 0.50),
-    maximum=min(150.0, Mc_guess * 1.70),
-    name="chirp_mass",
-    latex_label=r"$\mathcal{M}$",
-)
-    priors["mass_ratio"] = bilby.core.prior.Uniform(
-    minimum=0.1, maximum=1.0,
-    name="mass_ratio", latex_label="$q$",
+        minimum=max(2.0, Mc_guess * 0.50),
+        maximum=min(150.0, Mc_guess * 1.70),
+        name="chirp_mass", latex_label=r"$\mathcal{M}$",
     )
-    priors["mass_1"] = bilby.core.prior.Constraint(name="mass_1", minimum=1.0, maximum=300.0)
-    priors["mass_2"] = bilby.core.prior.Constraint(name="mass_2", minimum=1.0, maximum=300.0)
+    priors["ra"]  = bilby.core.prior.DeltaFunction(peak=given_ra,  name="ra")
+    priors["dec"] = bilby.core.prior.DeltaFunction(peak=given_dec, name="dec")
+    priors["psi"] = bilby.core.prior.DeltaFunction(peak=given_psi, name="psi")
 
-    priors["ra"]       = bilby.core.prior.DeltaFunction(peak=1.57, name="ra")
-    priors["dec"]      = bilby.core.prior.DeltaFunction(peak=0.0,  name="dec")
-    priors["psi"]      = bilby.core.prior.DeltaFunction(peak=0.0,  name="psi")
-    priors["theta_jn"] = bilby.core.prior.Sine(name="theta_jn")  
 
-    # # Non-spinning recovery -- spin estimation out of scope for this tool.
-    # priors["a_1"]    = bilby.core.prior.DeltaFunction(0.0)
-    # priors["a_2"]    = bilby.core.prior.DeltaFunction(0.0)
-    # priors["tilt_1"] = bilby.core.prior.DeltaFunction(0.0)
-    # priors["tilt_2"] = bilby.core.prior.DeltaFunction(0.0)
-    # priors["phi_12"] = bilby.core.prior.DeltaFunction(0.0)
-    # priors["phi_jl"] = bilby.core.prior.DeltaFunction(0.0)
-    # Aligned-spin recovery -- sample a_1/a_2 within approximant validity range.
-    # Precession parameters fixed since all supported approximants
-    # (IMRPhenomD, IMRPhenomXHM, SEOBNRv4) are aligned-spin only.
-    spin_limits = {
-        "IMRPhenomD":   0.88,
-        "IMRPhenomXHM": 0.99,
-        "SEOBNRv4":     0.99,
-        "SEOBNRv4_ROM": 0.99,
-    }
-    spin_max = spin_limits.get(approximant, 0.88)
+    if config.get("fix_inclination", True):
+        priors["theta_jn"] = bilby.core.prior.DeltaFunction(0.0)
+    else:
+        priors["theta_jn"] = bilby.core.prior.Sine(name="theta_jn")
 
-    priors["a_1"]    = bilby.core.prior.Uniform(
-        minimum=-spin_max, maximum=spin_max, name="a_1"
-    )
-    priors["a_2"]    = bilby.core.prior.Uniform(
-        minimum=-spin_max, maximum=spin_max, name="a_2"
-    )
+    if config.get("fix_spins", True):
+        priors["a_1"] = bilby.core.prior.DeltaFunction(0.0)
+        priors["a_2"] = bilby.core.prior.DeltaFunction(0.0)
+    else:
+        priors["a_1"] = bilby.core.prior.Uniform(-0.88, 0.88, name="a_1")
+        priors["a_2"] = bilby.core.prior.Uniform(-0.88, 0.88, name="a_2")
+
     priors["tilt_1"] = bilby.core.prior.DeltaFunction(0.0)
     priors["tilt_2"] = bilby.core.prior.DeltaFunction(0.0)
     priors["phi_12"] = bilby.core.prior.DeltaFunction(0.0)
     priors["phi_jl"] = bilby.core.prior.DeltaFunction(0.0)
 
-    # Time, phase, distance ranges -- only used as the marginalisation
-    # range/reference since all three are analytically marginalised
-    # in the likelihood below, not actually sampled as free parameters.
-    priors["geocent_time"]        = bilby.core.prior.Uniform(-0.1, 0.1, name="geocent_time")
+    priors["geocent_time"] = bilby.core.prior.Uniform(
+        minimum=-duration / 2.0, maximum=duration / 2.0, name="geocent_time"
+    )
     priors["luminosity_distance"] = bilby.core.prior.PowerLaw(
         alpha=2, name="luminosity_distance", minimum=10.0, maximum=5000.0
     )
-    priors["phase"] = bilby.core.prior.Uniform(0.0, 2 * np.pi, name="phase", boundary="periodic")
+    priors["phase"] = bilby.core.prior.Uniform(0.0, 2*np.pi, name="phase", boundary="periodic")
 
-    # ---- Likelihood -- Whittle likelihood via GravitationalWaveTransient.
-    # time/distance/phase marginalised analytically since their true
-    # values are unknown (the tutorial's real-event example instead
-    # fixes them and only marginalises phase -- valid there because it
-    # cheats with the known injection values; not valid for us). ----
     likelihood = bilby.gw.likelihood.GravitationalWaveTransient(
         interferometers=interferometers,
         waveform_generator=waveform_generator,
@@ -455,50 +453,46 @@ def run_bayesian_pe(strain_H1: list, psd_H1: list,
         jitter_time=False,
     )
 
+
+    n_cores = max(1, os.cpu_count() - 2)
+    t0 = time.time()
     result = bilby.run_sampler(
-        likelihood=likelihood,
-        priors=priors,
-        sampler="dynesty",
-        nlive=int(nlive),
-        # sample="rwalk",
-        sample="slice",
-        walks=None,
-        nact=10,
-        dlogz=0.1,
-        outdir="/tmp/bilby_pe_out",
-        label="gw_pe",
-        clean=True,
-        verbose=False,
-        plot=False,
-        save=False,
+        likelihood=likelihood, priors=priors, sampler="dynesty",
+        sample=config.get("sample", "rwalk"),
+        walks=config.get("walks", 50),
+        nact=config.get("nact", 5),
+        dlogz=config.get("dlogz", 0.5),
+        nlive=int(config.get("nlive", 150)),
+        npool=n_cores,
+        outdir="/tmp/bilby_pe_out", label="gw_pe", clean=True,
+        verbose=False, plot=False, save=False,
         conversion_function=bilby.gw.conversion.generate_all_bbh_parameters,
         result_class=bilby.gw.result.CBCResult,
     )
+    elapsed = time.time() - t0
+    print(f"[run_bayesian_pe] sampler wall time: {elapsed:.1f}s, n_cores={n_cores}")
 
-    post  = result.posterior
+    post = result.posterior
     ln_bf = float(result.log_bayes_factor) if hasattr(result, "log_bayes_factor") else float("nan")
 
     out = {
-        "chirp_mass_Msun":     round(float(post["chirp_mass"].median()), 4),
-        "mass_ratio":          round(float(post["mass_ratio"].median()), 4),
-        "chirp_mass_5pct":     round(float(post["chirp_mass"].quantile(0.05)), 4),
-        "chirp_mass_95pct":    round(float(post["chirp_mass"].quantile(0.95)), 4),
-        "mass_ratio_5pct":     round(float(post["mass_ratio"].quantile(0.05)), 4),
-        "mass_ratio_95pct":    round(float(post["mass_ratio"].quantile(0.95)), 4),
-        "ra_median":           round(float(post["ra"].median()), 4),
-        "dec_median":          round(float(post["dec"].median()), 4),
-        "log_bayes_factor":    round(ln_bf, 2),
+        "chirp_mass_Msun":  round(float(post["chirp_mass"].median()), 4),
+        "mass_ratio":       round(float(post["mass_ratio"].median()), 4),
+        "chirp_mass_5pct":  round(float(post["chirp_mass"].quantile(0.05)), 4),
+        "chirp_mass_95pct": round(float(post["chirp_mass"].quantile(0.95)), 4),
+        "mass_ratio_5pct":  round(float(post["mass_ratio"].quantile(0.05)), 4),
+        "mass_ratio_95pct": round(float(post["mass_ratio"].quantile(0.95)), 4),
+        "coalescence_time_s":     round(float(post["geocent_time"].median()) + peak_time, 4),
+        "coalescence_time_5pct":  round(float(post["geocent_time"].quantile(0.05)) + peak_time, 4),
+        "coalescence_time_95pct": round(float(post["geocent_time"].quantile(0.95)) + peak_time, 4),
+        "log_bayes_factor": round(ln_bf, 2),
         "n_posterior_samples": int(len(post)),
+        "config_used": config,
+        "sampler_wall_time_s": round(elapsed, 1),
     }
-
-    # generate_all_bbh_parameters gives us mass_1 / mass_2 directly --
-    # use them if present, otherwise fall back to the analytic conversion.
     if "mass_1" in post.columns and "mass_2" in post.columns:
         out["mass1_Msun"] = round(float(post["mass_1"].median()), 3)
         out["mass2_Msun"] = round(float(post["mass_2"].median()), 3)
-    if "chi_eff" in post.columns:
-        out["chi_eff_median"] = round(float(post["chi_eff"].median()), 4)
-
     return out
 
 
@@ -532,35 +526,6 @@ def estimate_component_masses(chirp_mass_Msun: float,
     }
 
 
-# =============================================================================
-# Tool 5 -- Merger type classification
-# =============================================================================
-
-@tool
-def classify_merger_type(mass1_Msun: float, mass2_Msun: float) -> dict:
-    """
-    Classify merger type as BBH, BNS, or NSBH from component masses.
-    Neutron star mass range: 1.0-3.0 Msun. Black hole: > 3.0 Msun.
-    Returns merger_type (exactly BBH, BNS, or NSBH) and reasoning.
-
-    Args:
-        mass1_Msun: primary component mass in solar masses
-        mass2_Msun: secondary component mass in solar masses
-    """
-    NS_MAX = 3.0
-    m1 = max(mass1_Msun, mass2_Msun)
-    m2 = min(mass1_Msun, mass2_Msun)
-    if m1 > NS_MAX and m2 > NS_MAX:
-        mtype  = "BBH"
-        reason = f"Both masses ({m1:.1f}, {m2:.1f} Msun) exceed {NS_MAX} Msun"
-    elif m1 <= NS_MAX and m2 <= NS_MAX:
-        mtype  = "BNS"
-        reason = f"Both masses ({m1:.1f}, {m2:.1f} Msun) in NS range"
-    else:
-        mtype  = "NSBH"
-        reason = f"Mixed: BH ({m1:.1f} Msun) + NS ({m2:.1f} Msun)"
-    return {"merger_type": mtype, "reasoning": reason}
-
 
 # =============================================================================
 # Tool 6 -- Waveform / strain plotting
@@ -571,6 +536,7 @@ def plot_chirp_signal(strain_H1: list, strain_L1: list,
                        psd_H1: list, psd_freqs: list,
                        sample_rate: int,
                        chirp_mass_Msun: float, mass_ratio: float,
+                       merger_time_s: float = None,
                        output_path: str = "/tmp/gw_chirp_plot.png",
                        f_lower: float = 20.0, approximant: str = "IMRPhenomD") -> dict:
     """
@@ -590,6 +556,7 @@ def plot_chirp_signal(strain_H1: list, strain_L1: list,
         sample_rate: sampling rate in Hz -- use data["sample_rate"] from load_gw_data
         chirp_mass_Msun: final recovered chirp mass for the overlay template
         mass_ratio: final recovered mass ratio for the overlay template
+        merger_time_s: merger_time_s from seed_pe_prior_via_matched_filter. If None, estimated from whitened strain peak
         output_path: where to save the PNG
         f_lower: lower frequency cutoff in Hz e.g. 20.0
         approximant: waveform approximant e.g. IMRPhenomD
@@ -630,13 +597,19 @@ def plot_chirp_signal(strain_H1: list, strain_L1: list,
     # Scale raw strain to whitened amplitude for visual overlay
     raw_H1_t     = strain_H1_arr[edge:-edge]
     raw_L1_t     = strain_L1_arr[edge:-edge]
-    raw_scale_H1 = np.std(white_H1_t) / (np.std(raw_H1_t) + 1e-50)
-    raw_scale_L1 = np.std(white_L1_t) / (np.std(raw_L1_t) + 1e-50)
+    # raw_scale_H1 = np.std(white_H1_t) / (np.std(raw_H1_t) + 1e-50)
+    # raw_scale_L1 = np.std(white_L1_t) / (np.std(raw_L1_t) + 1e-50)
  
-    # ── Merger time from whitened H1 peak ───────────────────────────
-    merger_idx  = int(np.argmax(np.abs(white_H1)))
-    merger_time = float(merger_idx) / sample_rate
- 
+    # ── Find merger time ─────────────────────────────────────────────
+    # Use matched filter merger time if provided — more accurate than
+    # whitened strain peak, especially at lower SNR
+    if merger_time_s is not None:
+        merger_time = float(merger_time_s)
+        merger_idx  = int(merger_time * sample_rate)
+        merger_idx  = min(merger_idx, len(white_H1) - 1)  # guard against out of bounds
+    else:
+        merger_idx  = int(np.argmax(np.abs(white_H1)))
+        merger_time = float(merger_idx) / sample_rate
     # ── Best-fit template aligned to merger time ─────────────────────
     template_plotted = False
     white_tmpl_t     = None
@@ -823,3 +796,292 @@ def plot_chirp_signal(strain_H1: list, strain_L1: list,
         "merger_time_s":     round(merger_time, 3),
     }
  
+# =============================================================================
+# Tool 7 -- PE result diagnostics (objective facts only, no decision)
+# =============================================================================
+
+@tool
+def inspect_pe_result(pe_result: dict) -> dict:
+    """
+    Compute objective diagnostic statistics from a run_bayesian_pe result,
+    This tool does NOT decide whether to accept or retry -- it only reports facts,
+    including the FULL sampler config used, for you to reason about yourself.
+
+    If pe_result is missing expected fields (e.g. the PE run failed before
+    producing a posterior), returns pe_run_failed=True with the error
+    message instead of raising -- check this field first before reading
+    any of the other diagnostic values.
+
+    Args:
+        pe_result: the dict returned by run_bayesian_pe
+    """
+    if "chirp_mass_95pct" not in pe_result or "coalescence_time_95pct" not in pe_result:
+        return {
+            "pe_run_failed": True,
+            "error": pe_result.get("error_message") or pe_result.get("error") or "malformed pe_result",
+        }
+
+    config = pe_result.get("config_used", {})
+
+    chirp_mass_ci_width = round(
+        float(pe_result["chirp_mass_95pct"] - pe_result["chirp_mass_5pct"]), 4
+    )
+    coalescence_time_ci_width = round(
+        float(pe_result["coalescence_time_95pct"] - pe_result["coalescence_time_5pct"]), 4
+    )
+
+    return {
+        "pe_run_failed": False,
+        "chirp_mass_ci_width": chirp_mass_ci_width,
+        "coalescence_time_ci_width": coalescence_time_ci_width,
+        "chirp_mass_median": pe_result.get("chirp_mass_Msun"),
+        "coalescence_time_median": pe_result.get("coalescence_time_s"),
+        "log_bayes_factor": pe_result.get("log_bayes_factor"),
+        "n_posterior_samples": pe_result.get("n_posterior_samples"),
+        "fix_spins_used": bool(config.get("fix_spins", True)),
+        "fix_inclination_used": bool(config.get("fix_inclination", True)),
+        "nlive_used": config.get("nlive"),
+        "sample_used": config.get("sample"),
+        "walks_used": config.get("walks"),
+        "nact_used": config.get("nact"),
+        "dlogz_used": config.get("dlogz"),
+        "config_rationale": config.get("rationale", ""),
+    }
+
+# =============================================================================
+# Tool 8 -- Package the critic agent's own decision (validates, doesn't decide)
+# =============================================================================
+@tool
+def package_pe_critique(recommendation: str, reasoning: str,
+                         log_bayes_factor: float,
+                         chi2_reduced: float,
+                         retry_nlive: int = None,
+                         retry_sample: str = None,
+                         retry_walks: int = None,
+                         retry_nact: int = None,
+                         retry_dlogz: float = None) -> dict:
+    """
+    Package your own accept/retry decision into a validated dict. This
+    tool does NOT decide anything for you -- you must inspect the PE
+    result yourself (via inspect_pe_result and check_waveform_residual)
+    and decide.
+
+    A plain "accept" is blocked when chi2_reduced or log_bayes_factor
+    fall outside acceptable ranges. In that case, use "retry" with
+    adjusted sampler settings, or "accept_with_caveat" with an explicit
+    justification.
+
+    If recommending a retry, specify ONLY the config keys you actually
+    want changed via the retry_* arguments -- leave any you don't want
+    to change as None, and the orchestrator will keep the previous
+    attempt's value for those. Only touch what your reasoning actually
+    supports changing.
+
+    Args:
+        recommendation: your decision -- must be exactly "accept",
+            "retry", or "accept_with_caveat"
+        reasoning: your reasoning for this decision, for logging
+        log_bayes_factor: pass through from inspect_pe_result
+        chi2_reduced: pass through from check_waveform_residual
+        retry_nlive: if retrying, new nlive value. None = unchanged.
+        retry_sample: if retrying, new dynesty sample method
+            (e.g. "rwalk", "slice"). None = unchanged.
+        retry_walks: if retrying, new walks value. None = unchanged.
+        retry_nact: if retrying, new nact value. None = unchanged.
+        retry_dlogz: if retrying, new dlogz value. None = unchanged.
+    """
+    valid = {"accept", "retry", "accept_with_caveat"}
+    if recommendation not in valid:
+        raise ValueError(f"recommendation must be one of {valid}, got {recommendation!r}")
+
+    if recommendation == "accept" and (chi2_reduced > 3.0 or log_bayes_factor < 0):
+        raise ValueError(
+            "Cannot recommend plain 'accept': chi2_reduced is "
+            f"{chi2_reduced:.2f} and/or log_bayes_factor is "
+            f"{log_bayes_factor:.2f}, suggesting a poor fit or weak "
+            "detection. Use recommendation='retry' with adjusted sampler "
+            "settings (e.g. higher nlive, tighter dlogz), or "
+            "'accept_with_caveat' if you have a specific budget-based "
+            "reason to accept anyway."
+        )
+
+    return {
+        "recommendation": recommendation,
+        "reasoning": reasoning,
+        "retry_nlive": retry_nlive,
+        "retry_sample": retry_sample,
+        "retry_walks": retry_walks,
+        "retry_nact": retry_nact,
+        "retry_dlogz": retry_dlogz,
+    }
+
+@tool
+def check_waveform_residual(strain_H1: list, psd_H1: list, psd_freqs: list,
+                             sample_rate: int, chirp_mass_Msun: float,
+                             mass_ratio: float, merger_time_s: float,
+                             f_lower: float = 20.0,
+                             approximant: str = "IMRPhenomD",
+                             n_bins: int = 8) -> dict:
+    """
+    Chi-square signal consistency test, following the standard LVK
+    matched-filter chi-square test (Allen 2005). Splits the frequency
+    band into n_bins sub-bands each contributing equal expected template
+    SNR, computes the matched-filter SNR contribution z_i in each
+    sub-band, and checks whether SNR accumulates evenly across sub-bands
+    (consistent with a good template match) or unevenly (suggesting the
+    template does NOT explain the data well -- a red flag independent
+    of any posterior width or Bayes factor).
+
+    A well-fitting signal gives chi2_reduced near 1.0. Values well above
+    1.0 (e.g. >2-3) suggest the recovered parameters don't actually
+    explain the data -- a genuinely blind, ground-truth-free fit-quality
+    check, unlike CI width which only measures the sampler's confidence.
+
+    Args:
+        strain_H1: H1 strain time series -- use data["strain_H1"] from load_gw_data
+        psd_H1: H1 PSD -- use data["psd_H1"] from load_gw_data
+        psd_freqs: PSD frequency axis -- use data["psd_freqs"] from load_gw_data
+        sample_rate: sampling rate in Hz -- use data["sample_rate"] from load_gw_data
+        chirp_mass_Msun: recovered chirp mass to build the template
+        mass_ratio: recovered mass ratio to build the template
+        merger_time_s: merger_time_s from seed_pe_prior_via_matched_filter
+        f_lower: lower frequency cutoff in Hz e.g. 20.0
+        approximant: waveform approximant e.g. IMRPhenomD
+        n_bins: number of frequency sub-bands for the chi-square test
+                (standard values: 8-16)
+    """
+    import numpy as np
+    from pycbc.waveform import get_fd_waveform
+
+    sample_rate = int(sample_rate)
+    dt = 1.0 / sample_rate
+    strain_arr = np.asarray(strain_H1, dtype=np.float64)
+    psd_arr = np.asarray(psd_H1, dtype=np.float64)
+    freqs_data = np.asarray(psd_freqs, dtype=np.float64)
+    N = len(strain_arr)
+    delta_f = 1.0 / (N * dt)
+    flen = N // 2 + 1
+
+    q = float(np.clip(mass_ratio, 0.05, 1.0))
+    Mc = float(chirp_mass_Msun)
+    m1 = Mc * (1.0 + q) ** (1.0/5.0) / q ** (3.0/5.0)
+    m2 = q * m1
+
+    hp, _ = get_fd_waveform(
+        approximant=approximant, mass1=m1, mass2=m2,
+        spin1z=0.0, spin2z=0.0, delta_f=delta_f,
+        f_lower=f_lower, f_final=float(0.5 / dt),
+    )
+    tmpl = np.asarray(hp.data, dtype=complex)
+    if len(tmpl) < flen:
+        tmpl = np.pad(tmpl, (0, flen - len(tmpl)))
+    elif len(tmpl) > flen:
+        tmpl = tmpl[:flen]
+
+    freqs = np.arange(flen) * delta_f
+    psd_i = np.interp(freqs, freqs_data, psd_arr, left=1e-40, right=1e-40)
+    psd_i = np.where(psd_i > 0, psd_i, 1e-40)
+    band_mask = freqs >= f_lower
+
+    data_f = np.fft.rfft(strain_arr) * dt
+
+    # Time-shift template to merger_time_s via phase shift in frequency domain.
+    # A small local time search is needed here: sub-millisecond timing
+    # residuals (from waveform-generation conventions, quantization, etc.)
+    # cause many radians of phase drift at high frequency even though they
+    # look negligible in the time domain -- this test is highly sensitive
+    # to exactly that. Search a small window around merger_time_s for the
+    # offset that maximizes total coherent SNR before computing chi2.
+    best_offset, best_total_snr = 0.0, -1.0
+    for dt_search in np.linspace(-0.01, 0.01, 41):  # +/-10ms, 0.5ms steps
+        trial_shift = np.exp(-2j * np.pi * freqs * (merger_time_s + dt_search))
+        trial_tmpl = tmpl * trial_shift
+        trial_total = np.sum(
+            (np.conj(trial_tmpl[band_mask]) * data_f[band_mask]) / psd_i[band_mask]
+        ) * delta_f
+        if abs(trial_total) > best_total_snr:
+            best_total_snr = abs(trial_total)
+            best_offset = dt_search
+
+    phase_shift = np.exp(-2j * np.pi * freqs * (merger_time_s + best_offset))
+    tmpl_shifted = tmpl * phase_shift
+
+    # Optimal matched-filter amplitude/phase scale (best-fit normalization) --
+    # get_fd_waveform defaults to distance=1 Mpc, so the raw template is
+    # orders of magnitude too large compared to the actual injected signal.
+    # This rescales it to the best-fit amplitude before any chi2 computation.
+    numerator = np.sum((np.conj(tmpl_shifted[band_mask]) * data_f[band_mask]) / psd_i[band_mask]) * delta_f
+    denominator = np.sum((np.abs(tmpl_shifted[band_mask])**2) / psd_i[band_mask]) * delta_f
+    best_fit_scale = numerator / denominator if denominator > 0 else 0.0
+    tmpl_shifted = tmpl_shifted * best_fit_scale
+
+    # Bin edges: equal expected template SNR^2 per bin (standard Allen 2005 construction)
+    weight = (np.abs(tmpl_shifted)**2 / psd_i) * band_mask
+    cum_weight = np.cumsum(weight)
+    total_weight = cum_weight[-1] if cum_weight[-1] > 0 else 1.0
+    bin_edges_weight = np.linspace(0, total_weight, n_bins + 1)
+    bin_indices = np.searchsorted(cum_weight, bin_edges_weight)
+    bin_indices[0] = np.argmax(band_mask)
+    bin_indices[-1] = flen
+
+    # Per-bin matched-filter SNR contribution: z_i = (template|data) in band i
+    # Per-bin matched-filter SNR contribution: z_i = (template|data) in band i
+    z_per_bin = []
+    for i in range(n_bins):
+        lo, hi = bin_indices[i], bin_indices[i+1]
+        if hi <= lo:
+            z_per_bin.append(0.0 + 0.0j)
+            continue
+        zi = np.sum(np.conj(tmpl_shifted[lo:hi]) * data_f[lo:hi] / psd_i[lo:hi]) * delta_f
+        z_per_bin.append(zi)
+
+    # Normalize by the template's own noise-weighted norm (sigma), so z_i are
+    # proper dimensionless matched-filter SNRs, not raw overlaps that scale
+    # like SNR^2 and blow chi2 up by that factor.
+    sigma = np.sqrt(np.sum((np.abs(tmpl_shifted[band_mask])**2) / psd_i[band_mask]) * delta_f)
+    z_per_bin = [zi / sigma for zi in z_per_bin] if sigma > 0 else z_per_bin
+
+    z_total = sum(z_per_bin)
+    p = len(z_per_bin)
+    expected_per_bin = z_total / p if p > 0 else 0.0
+
+    chi2 = p * sum(abs(zi - expected_per_bin) ** 2 for zi in z_per_bin)
+    dof = max(1, 2 * p - 2)
+    chi2_reduced = chi2 / dof
+    # ---- END REPLACEMENT ----
+
+    return {
+        "chi2": round(float(chi2), 3),
+        "chi2_dof": dof,
+        "chi2_reduced": round(float(chi2_reduced), 3),
+        "n_bins_used": p,
+        "note": (
+            "chi2_reduced near 1.0 means the matched-filter SNR accumulates "
+            "evenly across frequency sub-bands as the template predicts -- "
+            "good fit. Well above 1.0 (e.g. >2-3) means SNR is concentrated "
+            "unevenly, suggesting the recovered parameters don't actually "
+            "fit the data well, regardless of posterior confidence. This "
+            "follows the standard LVK matched-filter chi-square consistency "
+            "test (Allen 2005)."
+        ),
+    }
+
+@tool
+def classify_merger_type(mass1_Msun: float, mass2_Msun: float) -> str:
+    """
+    Classify a compact binary merger as BNS, NSBH, or BBH based on
+    component masses, using the standard 3 solar-mass neutron-star/
+    black-hole boundary.
+
+    Args:
+        mass1_Msun: primary component mass in solar masses
+        mass2_Msun: secondary component mass in solar masses
+    """
+    m1 = float(mass1_Msun)
+    m2 = float(mass2_Msun)
+    ns_max = 3.0
+    if m1 <= ns_max and m2 <= ns_max:
+        return "BNS"
+    if m1 > ns_max and m2 > ns_max:
+        return "BBH"
+    return "NSBH"
